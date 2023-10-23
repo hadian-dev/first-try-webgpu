@@ -1,5 +1,7 @@
 const canvas = document.querySelector('canvas');
 
+const GRID_SIZE = 32;
+
 function showError(message) {
   const errorMessageEl = document.createElement('div');
   errorMessageEl.classList = 'error-message';
@@ -91,9 +93,21 @@ async function main() {
   // Create shader module
   const cellShaderModule = device.createShaderModule({
     label: 'Cell shader',
-    code: `@vertex
-fn vertexMain(@location(0) pos: vec2f) -> @builtin(position) vec4f {
-  return vec4f(pos, 0, 1);
+    code: `@group(0) @binding(0) var<uniform> grid: vec2f;
+
+@vertex
+fn vertexMain(
+  @location(0) pos: vec2f, 
+  @builtin(instance_index) instance: u32
+  ) -> @builtin(position) vec4f {
+
+  let index = f32(instance);
+  let cell = vec2f(index % grid.x, floor(index / grid.x));
+  
+  let cellOffset = cell / grid * 2;
+  let gridPos = (pos + 1) / grid - 1 + cellOffset;
+
+  return vec4f(gridPos, 0, 1);
 }
 
 @fragment
@@ -118,10 +132,30 @@ fn fragmentMain() -> @location(0) vec4f {
     },
   });
 
+  // Create a uniform buffer that describe the grid
+  const uniformArray = new Float32Array([GRID_SIZE, GRID_SIZE]);
+  const uniformBuffer = device.createBuffer({
+    label: 'Grid Uniform',
+    size: uniformArray.byteLength,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  // Copy data to the uniform buffer
+  device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+
+  // Create a bind group with uniform buffer
+  const uniformBindGroup = device.createBindGroup({
+    label: 'Cell Uniform Bind Group',
+    layout: cellPipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+  });
+
   passEncoder.setPipeline(cellPipeline);
   passEncoder.setVertexBuffer(0, vertexBuffer);
-  passEncoder.draw(vertices.length / 2);
 
+  passEncoder.setBindGroup(0, uniformBindGroup);
+
+  passEncoder.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE);
   passEncoder.end();
 
   const commandBuffer = encoder.finish();
