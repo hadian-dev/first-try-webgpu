@@ -2,6 +2,8 @@ const canvas = document.querySelector('canvas');
 
 const GRID_SIZE = 32;
 const UPDATE_INTERVAL = 200; // 5 times per second
+const WORKGROUP_SIZE = 8;
+const WORKGROUP_COUNT = Math.ceil(GRID_SIZE / WORKGROUP_SIZE);
 let step = 0; // Track simulation steps
 
 function showError(message) {
@@ -121,14 +123,100 @@ fn fragmentMain(input : VertexOutput) -> @location(0) vec4f {
 
   // Create shader module
   const cellShaderModule = device.createShaderModule({
-    label: 'Cell shader',
+    label: 'Cell Shader',
     code: wgslCode,
+  });
+
+  // Compute shader to process the simulation
+  const simulationShaderModule = device.createShaderModule({
+    label: 'Simulation Shader',
+    code: /* wgsl */ `
+@group(0) @binding(0) var<uniform> grid: vec2f;
+
+@group(0) @binding(1) var<storage> cellStateIn: array<u32>;
+@group(0) @binding(2) var<storage, read_write> cellStateOut: array<u32>;
+
+fn cellIndex(cell: vec2u) -> u32 {
+  return (cell.y % u32(grid.y)) * u32(grid.x) + (cell.x % u32(grid.x));
+}
+
+fn cellActive(x: u32, y: u32) -> u32 {
+  return cellStateIn[cellIndex(vec2(x, y))];
+}
+
+@compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+fn computeMain(@builtin(global_invocation_id) cell: vec3u) {
+  let activeNeighbors = cellActive(cell.x + 1, cell.y + 1) +
+                        cellActive(cell.x + 1, cell.y) +
+                        cellActive(cell.x + 1, cell.y - 1) +
+                        cellActive(cell.x, cell.y - 1) +
+                        cellActive(cell.x - 1, cell.y - 1) +
+                        cellActive(cell.x - 1, cell.y) +
+                        cellActive(cell.x - 1, cell.y + 1) +
+                        cellActive(cell.x, cell.y + 1);
+  
+  let index = cellIndex(cell.xy);
+
+  switch activeNeighbors {
+    case 2: {
+      cellStateOut[index] = cellStateIn[index];
+    }
+    case 3: {
+      cellStateOut[index] = 1;
+    }
+    default: {
+      cellStateOut[index] = 0;
+    }
+  }
+}
+`,
+  });
+
+  // Create bind group layout
+  const bindGroupLayout = device.createBindGroupLayout({
+    label: 'Cell Bind Group Layout',
+    entries: [
+      {
+        binding: 0,
+        visibility:
+          GPUShaderStage.VERTEX |
+          GPUShaderStage.FRAGMENT |
+          GPUShaderStage.COMPUTE,
+        buffer: {},
+      },
+      {
+        binding: 1,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+        buffer: { type: 'read-only-storage' },
+      },
+      {
+        binding: 2,
+        visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: 'storage' },
+      },
+    ],
+  });
+
+  // Create pipeline layout
+  const pipelineLayout = device.createPipelineLayout({
+    label: 'Cell Compute Pipeline Layout',
+    bindGroupLayouts: [bindGroupLayout],
+  });
+
+  // Create a compute pipeline to update game state
+  const simulationPipeline = device.createComputePipeline({
+    label: 'Simulation Compute Pipeline',
+    layout: pipelineLayout,
+    compute: {
+      module: simulationShaderModule,
+      entryPoint: 'computeMain',
+    },
   });
 
   // Cell render pipeline
   const cellPipeline = device.createRenderPipeline({
     label: 'Cell pipeline',
-    layout: 'auto',
+    layout: pipelineLayout,
     vertex: {
       module: cellShaderModule,
       entryPoint: 'vertexMain',
@@ -169,7 +257,7 @@ fn fragmentMain(input : VertexOutput) -> @location(0) vec4f {
   ];
 
   for (let i = 0; i < cellStateArray.length; i += 3) {
-    cellStateArray[i] = 1;
+    cellStateArray[i] = Math.random() > 0.6 ? 1 : 0;
   }
   device.queue.writeBuffer(cellStateStorageBuffer[0], 0, cellStateArray);
 
@@ -179,26 +267,36 @@ fn fragmentMain(input : VertexOutput) -> @location(0) vec4f {
   device.queue.writeBuffer(cellStateStorageBuffer[1], 0, cellStateArray);
 
   // Create a bind group with uniform buffer
-  const uniformBindGroup = [
+  const uniformBindGroups = [
     device.createBindGroup({
       label: 'Cell Uniform Bind Group A',
-      layout: cellPipeline.getBindGroupLayout(0),
+      layout: bindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: uniformBuffer } },
         { binding: 1, resource: { buffer: cellStateStorageBuffer[0] } },
+        { binding: 2, resource: { buffer: cellStateStorageBuffer[1] } },
       ],
     }),
     device.createBindGroup({
       label: 'Cell Uniform Bind Group B',
-      layout: cellPipeline.getBindGroupLayout(0),
+      layout: bindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: uniformBuffer } },
         { binding: 1, resource: { buffer: cellStateStorageBuffer[1] } },
+        { binding: 2, resource: { buffer: cellStateStorageBuffer[0] } },
       ],
     }),
   ];
 
   const updateGrid = () => {
+    const encoder = device.createCommandEncoder();
+    const computePass = encoder.beginComputePass();
+
+    computePass.setPipeline(simulationPipeline);
+    computePass.setBindGroup(0, uniformBindGroups[step % 2]);
+    computePass.dispatchWorkgroups(WORKGROUP_COUNT, WORKGROUP_COUNT);
+
+    computePass.end();
     step += 1;
 
     const textureView = context.getCurrentTexture().createView();
@@ -213,14 +311,12 @@ fn fragmentMain(input : VertexOutput) -> @location(0) vec4f {
       ],
     };
 
-    const encoder = device.createCommandEncoder();
     const passEncoder = encoder.beginRenderPass(renderPassDescriptor);
 
     passEncoder.setPipeline(cellPipeline);
     passEncoder.setVertexBuffer(0, vertexBuffer);
 
-    passEncoder.setBindGroup(0, uniformBindGroup[step % 2]);
-
+    passEncoder.setBindGroup(0, uniformBindGroups[step % 2]);
     passEncoder.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE);
     passEncoder.end();
 
